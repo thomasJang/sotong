@@ -30,6 +30,8 @@ export default function InstructorView() {
   const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
   const [resetError, setResetError] = useState('');
   const resetDialogRef = useRef(null);
+  const authAttemptRef = useRef(0);
+  const logoutPendingRef = useRef(false);
 
   useEffect(() => {
     if (isResetConfirmOpen) resetDialogRef.current?.showModal();
@@ -44,10 +46,12 @@ export default function InstructorView() {
 
   // 접속 초기화 및 소켓 리스너
   useEffect(() => {
-    const savedPw = localStorage.getItem('instructor_pw');
-    if (savedPw === '1937') {
-      attemptAuth(savedPw);
-    }
+    const restoreAuthentication = () => {
+      if (logoutPendingRef.current) return;
+      const savedPw = localStorage.getItem('instructor_pw');
+      if (savedPw) attemptAuth(savedPw);
+      else setIsAuthenticated(false);
+    };
 
     // 소켓 이벤트 리스너 등록
     const handleActiveChanged = ({ activeQuestionId: id }) => {
@@ -84,6 +88,8 @@ export default function InstructorView() {
     socket.on('question:summary_updated', handleSummaryUpdated);
     socket.on('summaries:sync', handleSummariesSync);
     socket.on('students:count', handleStudentsCount);
+    socket.on('connect', restoreAuthentication);
+    if (socket.connected) restoreAuthentication();
 
     return () => {
       socket.off('question:active_changed', handleActiveChanged);
@@ -91,15 +97,22 @@ export default function InstructorView() {
       socket.off('question:summary_updated', handleSummaryUpdated);
       socket.off('summaries:sync', handleSummariesSync);
       socket.off('students:count', handleStudentsCount);
+      socket.off('connect', restoreAuthentication);
     };
   }, []);
 
   const attemptAuth = (pw) => {
+    const attemptId = ++authAttemptRef.current;
     setIsAuthLoading(true);
     setErrorMsg('');
 
-    socket.emit('instructor:auth', { password: pw }, (res) => {
+    socket.timeout(8000).emit('instructor:auth', { password: pw }, (error, res) => {
+      if (attemptId !== authAttemptRef.current) return;
       setIsAuthLoading(false);
+      if (error) {
+        setErrorMsg('서버 연결을 확인한 뒤 다시 시도해주세요.');
+        return;
+      }
       if (res.success) {
         setIsAuthenticated(true);
         localStorage.setItem('instructor_pw', pw);
@@ -122,7 +135,9 @@ export default function InstructorView() {
 
   const handleLogout = () => {
     if (isLoggingOut) return;
+    authAttemptRef.current++;
     const finishLogout = () => {
+      setIsAuthLoading(false);
       localStorage.removeItem('instructor_pw');
       setIsAuthenticated(false);
       setPassword('');
@@ -136,7 +151,9 @@ export default function InstructorView() {
     }
 
     setIsLoggingOut(true);
+    logoutPendingRef.current = true;
     socket.volatile.timeout(5000).emit('instructor:logout', (error, res) => {
+      logoutPendingRef.current = false;
       setIsLoggingOut(false);
       if (error || !res?.success) {
         alert(res?.message || '종료 결과를 확인하지 못했습니다. 연결 상태를 확인해주세요.');

@@ -142,28 +142,85 @@ async function run() {
     questionId = session.question.id;
     assert.equal((await emit(student1, 'student:submit_answer', { questionId, answer: 'Keep this answer' })).success, true);
     assert.equal((await emit(student1, 'instructor:logout')).success, false);
-    assert.equal((await emit(instructor, 'instructor:logout')).success, true);
-    assert.equal((await emit(student1, 'student:sync_state')).activeQuestion.id, questionId);
-    assert.equal((await emit(instructor, 'instructor:create_question', { title: 'Logged out' })).success, false);
 
-    const disconnected = event(student1, 'question:active_changed', data => data.activeQuestion === null);
-    observer.disconnect();
-    await disconnected;
+    // Disconnected students must also lose automatic sign-in for the ended session.
+    const offline = await connect();
+    const offlineLogin = await emit(offline, 'student:auth', { password: studentPassword });
+    assert.equal(offlineLogin.success, true);
+    offline.disconnect();
+    const kicked = [student1, student2].map(socket => event(socket, 'students:session_ended'));
+    assert.equal((await emit(instructor, 'instructor:logout')).success, true);
+    await Promise.all(kicked);
+    assert.equal((await emit(instructor, 'instructor:create_question', { title: 'Logged out' })).success, false);
     assert.equal((await emit(student1, 'student:submit_answer', { questionId, answer: 'Too late' })).success, false);
+    assert.deepEqual(await emit(student1, 'student:sync_state'), { activeQuestion: null, myAnswer: null });
+    const endedSession = await emit(observer, 'instructor:auth', { password: instructorPassword });
+    assert.equal(endedSession.data.activeQuestionId, null);
+    assert.equal(endedSession.data.onlineStudentsCount, 0);
+    assert.equal(endedSession.data.summaries[questionId].answers[0].answer, 'Keep this answer');
+    const stale = await emit(student1, 'student:auth', {
+      password: studentPassword, studentId: s1.student.id, sessionId: s1.sessionId, restoreSession: true
+    });
+    assert.equal(stale.success, false);
+    assert.equal(stale.sessionEnded, true);
+
+    // Instructor and students can immediately sign in again and submit answers.
+    assert.equal((await emit(instructor, 'instructor:auth', { password: instructorPassword })).success, true);
+    const reentered = await emit(student1, 'student:auth', { password: studentPassword, studentId: s1.student.id });
+    assert.equal(reentered.success, true);
+    assert.notEqual(reentered.sessionId, s1.sessionId);
+    assert.deepEqual(reentered.student, s1.student);
+    assert.equal((await emit(student2, 'student:auth', { password: studentPassword, studentId: s2.student.id })).success, true);
+    assert.equal((await emit(instructor, 'instructor:activate_question', { questionId })).success, true);
+    assert.equal((await emit(student1, 'student:submit_answer', { questionId, answer: 'Re-entry works' })).success, true);
+    const reconnected = await connect();
+    assert.equal((await emit(reconnected, 'student:auth', {
+      password: studentPassword, studentId: offlineLogin.student.id,
+      sessionId: offlineLogin.sessionId, restoreSession: true
+    })).sessionEnded, true);
+    assert.equal((await emit(reconnected, 'student:auth', { password: studentPassword })).success, true);
+    assert.equal((await emit(reconnected, 'student:logout')).success, true);
+    assert.equal((await emit(reconnected, 'student:submit_answer', { questionId, answer: 'Logged out' })).success, false);
+    assert.equal((await emit(student1, 'student:logout')).success, true);
+    assert.equal((await emit(observer, 'instructor:auth', { password: instructorPassword })).data.onlineStudentsCount, 1);
+    assert.equal((await emit(student1, 'student:auth', {
+      password: studentPassword, studentId: s1.student.id, sessionId: reentered.sessionId, restoreSession: true
+    })).success, true);
+
+    // Tab closure only ends the active question when the last instructor leaves.
+    let unexpectedSessionEnd = 0;
+    const trackEnd = () => { unexpectedSessionEnd++; };
+    student1.on('students:session_ended', trackEnd);
+    observer.disconnect();
+    assert.equal((await emit(student1, 'student:sync_state')).activeQuestion.id, questionId);
+    const disconnected = event(student1, 'question:active_changed', data => data.activeQuestion === null);
+    instructor.disconnect();
+    await disconnected;
+    assert.equal(unexpectedSessionEnd, 0);
+    student1.off('students:session_ended', trackEnd);
+    instructor = await connect();
     const returnLogin = await emit(instructor, 'instructor:auth', { password: instructorPassword });
     assert.equal(returnLogin.data.activeQuestionId, null);
+    assert.equal(returnLogin.data.onlineStudentsCount, 2);
     assert.equal(returnLogin.data.summaries[questionId].totalResponses, 1);
-    assert.equal(returnLogin.data.summaries[questionId].answers[0].answer, 'Keep this answer');
     assert.equal((await emit(instructor, 'instructor:activate_question', { questionId })).success, true);
-    const ended = event(student2, 'question:active_changed', data => data.activeQuestion === null);
+    assert.equal((await emit(student2, 'student:submit_answer', { questionId, answer: 'Still authenticated' })).success, true);
+
+    // All 50 students are logged out even when no question is active.
+    const extraStudents = await Promise.all(Array.from({ length: 48 }, () => connect()));
+    const extraLogins = await Promise.all(extraStudents.map(socket => emit(socket, 'student:auth', { password: studentPassword })));
+    assert.ok(extraLogins.every(login => login.success));
+    assert.equal((await emit(instructor, 'instructor:auth', { password: instructorPassword })).data.onlineStudentsCount, 50);
+    assert.equal((await emit(instructor, 'instructor:deactivate_question')).success, true);
+    const allKicked = [student1, student2, ...extraStudents].map(socket => event(socket, 'students:session_ended'));
     assert.equal((await emit(instructor, 'instructor:logout')).success, true);
-    await ended;
-    assert.equal((await emit(student2, 'student:sync_state')).activeQuestion, null);
+    await Promise.all(allKicked);
     assert.equal((await emit(instructor, 'instructor:logout')).success, false);
-    assert.equal((await emit(instructor, 'instructor:auth', { password: instructorPassword })).success, true);
+    assert.equal((await emit(instructor, 'instructor:auth', { password: instructorPassword })).data.onlineStudentsCount, 0);
     assert.equal((await emit(instructor, 'instructor:delete_question', { questionId })).success, true);
     questionId = null;
-    console.log('DEPARTURE_VERIFIED: last instructor logout/disconnect closes questions, other instructors and answers preserved');
+    console.log('SESSION_END_VERIFIED: 50 students logged out; stale restoration rejected; instructor/student re-login and re-entry work');
+    console.log('DEPARTURE_VERIFIED: last instructor disconnect closes question without logging students out');
   }
   console.log('INTERACTION_VERIFIED');
 }

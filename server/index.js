@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import QRCode from 'qrcode';
+import { randomUUID } from 'node:crypto';
 import { generateUniqueCharacter } from './nicknameGenerator.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,6 +26,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_URL = process.env.PUBLIC_URL ? new URL(process.env.PUBLIC_URL).origin : null;
 const INSTRUCTOR_PASSWORD = process.env.INSTRUCTOR_PASSWORD || '1937';
 const STUDENT_PASSWORD = process.env.STUDENT_PASSWORD || '1234';
+let studentSessionId = randomUUID();
 
 // 로컬 IPv4 주소 자동 탐색
 function getLocalIpAddress() {
@@ -217,8 +219,8 @@ function getOnlineStudentCount() {
   return count;
 }
 
-function closeQuestionIfNoInstructors() {
-  if (io.sockets.adapter.rooms.get('room:instructors')?.size || !state.activeQuestionId) return;
+function closeActiveQuestion() {
+  if (!state.activeQuestionId) return;
   state.activeQuestionId = null;
   io.emit('question:active_changed', {
     activeQuestionId: null,
@@ -226,10 +228,29 @@ function closeQuestionIfNoInstructors() {
   });
 }
 
+function closeQuestionIfNoInstructors() {
+  if (!io.sockets.adapter.rooms.get('room:instructors')?.size) closeActiveQuestion();
+}
+
+function revokeStudent(socket) {
+  const student = state.students.get(socket.data.currentStudentId);
+  if (student?.socketId === socket.id) student.connected = false;
+  socket.data.userRole = null;
+  socket.data.currentStudentId = null;
+  socket.leave('room:students');
+}
+
+function broadcastStudentCount() {
+  io.to('room:instructors').emit('students:count', {
+    onlineCount: getOnlineStudentCount(),
+    totalRegistered: state.students.size
+  });
+}
+
 // Socket.IO 이벤트 처리
 io.on('connection', (socket) => {
-  let userRole = null; // 'instructor' | 'student'
-  let currentStudentId = null;
+  socket.data.userRole = null; // 'instructor' | 'student'
+  socket.data.currentStudentId = null;
 
   // 1. 강의자 인증 및 접속
   socket.on('instructor:auth', ({ password }, callback) => {
@@ -237,7 +258,7 @@ io.on('connection', (socket) => {
       return callback({ success: false, message: '비밀번호가 일치하지 않습니다.' });
     }
 
-    userRole = 'instructor';
+    socket.data.userRole = 'instructor';
     socket.join('room:instructors');
 
     const activeQ = getActiveQuestion();
@@ -254,23 +275,34 @@ io.on('connection', (socket) => {
   });
 
   socket.on('instructor:logout', async (callback) => {
-    if (userRole !== 'instructor') {
+    if (socket.data.userRole !== 'instructor') {
       return callback?.({ success: false, message: '권한이 없습니다.' });
     }
 
-    userRole = null;
+    // 명시적인 강의 종료는 다른 강의자 탭이 있어도 모든 학생 인증을 해제합니다.
+    studentSessionId = randomUUID();
+    closeActiveQuestion();
+    io.to('room:students').emit('students:session_ended');
+    for (const studentSocket of io.sockets.sockets.values()) {
+      if (studentSocket.data.userRole === 'student') revokeStudent(studentSocket);
+    }
+    broadcastStudentCount();
+    socket.data.userRole = null;
     await socket.leave('room:instructors');
     closeQuestionIfNoInstructors();
     callback?.({ success: true });
   });
 
   // 2. 학생 인증 및 입장
-  socket.on('student:auth', ({ password, studentId }, callback) => {
+  socket.on('student:auth', ({ password, studentId, sessionId, restoreSession = false }, callback) => {
+    if (restoreSession && sessionId !== studentSessionId) {
+      return callback({ success: false, sessionEnded: true, message: '강의가 종료되었습니다. 다시 입장해주세요.' });
+    }
     if (password !== STUDENT_PASSWORD) {
       return callback({ success: false, message: '비밀번호가 일치하지 않습니다.' });
     }
 
-    userRole = 'student';
+    socket.data.userRole = 'student';
     socket.join('room:students');
 
     // 기존 학생 복원 또는 신규 학생 생성
@@ -295,7 +327,7 @@ io.on('connection', (socket) => {
       state.students.set(newId, student);
     }
 
-    currentStudentId = student.id;
+    socket.data.currentStudentId = student.id;
 
     // 현재 활성화된 질문과 학생의 기존 답변 확인
     const activeQ = getActiveQuestion();
@@ -312,6 +344,7 @@ io.on('connection', (socket) => {
 
     callback({
       success: true,
+      sessionId: studentSessionId,
       student: {
         id: student.id,
         name: student.name,
@@ -322,12 +355,22 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('student:logout', (callback) => {
+    if (socket.data.userRole !== 'student') return callback?.({ success: false, message: '학생 인증이 필요합니다.' });
+    revokeStudent(socket);
+    broadcastStudentCount();
+    callback?.({ success: true });
+  });
+
   // 2-1. 학생: 현재 질문 및 내 답변 동기화 요청
   socket.on('student:sync_state', (callback) => {
+    if (socket.data.userRole !== 'student') {
+      return callback?.({ activeQuestion: null, myAnswer: null });
+    }
     const activeQ = getActiveQuestion();
     let myAnswer = null;
-    if (activeQ && currentStudentId && state.answers[activeQ.id] && state.answers[activeQ.id][currentStudentId]) {
-      myAnswer = state.answers[activeQ.id][currentStudentId].answer;
+    if (activeQ && socket.data.currentStudentId && state.answers[activeQ.id] && state.answers[activeQ.id][socket.data.currentStudentId]) {
+      myAnswer = state.answers[activeQ.id][socket.data.currentStudentId].answer;
     }
     callback?.({
       activeQuestion: activeQ,
@@ -337,7 +380,7 @@ io.on('connection', (socket) => {
 
   // 3. 학생: 답변 제출 및 변경
   socket.on('student:submit_answer', ({ questionId, answer }, callback) => {
-    if (userRole !== 'student' || !currentStudentId) {
+    if (socket.data.userRole !== 'student' || !socket.data.currentStudentId) {
       return callback?.({ success: false, message: '학생 인증이 필요합니다.' });
     }
 
@@ -346,7 +389,7 @@ io.on('connection', (socket) => {
       return callback?.({ success: false, message: '현재 진행 중인 질문이 아니므로 답변을 제출하거나 변경할 수 없습니다.' });
     }
 
-    const student = state.students.get(currentStudentId);
+    const student = state.students.get(socket.data.currentStudentId);
     if (!student) {
       return callback?.({ success: false, message: '학생 정보를 찾을 수 없습니다.' });
     }
@@ -356,7 +399,7 @@ io.on('connection', (socket) => {
     }
 
     // 답변 저장 또는 갱신 (다음 질문 전까지 계속 변경 가능)
-    state.answers[questionId][currentStudentId] = {
+    state.answers[questionId][socket.data.currentStudentId] = {
       answer,
       studentName: student.name,
       studentIcon: student.icon,
@@ -375,7 +418,7 @@ io.on('connection', (socket) => {
 
   // 4. 강의자: 새 질문 생성
   socket.on('instructor:create_question', ({ title, type, options, activateImmediately }, callback) => {
-    if (userRole !== 'instructor') {
+    if (socket.data.userRole !== 'instructor') {
       return callback?.({ success: false, message: '권한이 없습니다.' });
     }
 
@@ -416,7 +459,7 @@ io.on('connection', (socket) => {
 
   // 5. 강의자: 질문 활성화 (학생들에게 문제 출제)
   socket.on('instructor:activate_question', ({ questionId }, callback) => {
-    if (userRole !== 'instructor') {
+    if (socket.data.userRole !== 'instructor') {
       return callback?.({ success: false, message: '권한이 없습니다.' });
     }
 
@@ -438,7 +481,7 @@ io.on('connection', (socket) => {
 
   // 6. 강의자: 질문 비활성화 (대기 상태 "질문이 없습니다"로 전환)
   socket.on('instructor:deactivate_question', (callback) => {
-    if (userRole !== 'instructor') {
+    if (socket.data.userRole !== 'instructor') {
       return callback?.({ success: false, message: '권한이 없습니다.' });
     }
 
@@ -454,7 +497,7 @@ io.on('connection', (socket) => {
 
   // 7. 강의자: 질문 삭제
   socket.on('instructor:delete_question', ({ questionId }, callback) => {
-    if (userRole !== 'instructor') {
+    if (socket.data.userRole !== 'instructor') {
       return callback?.({ success: false, message: '권한이 없습니다.' });
     }
 
@@ -479,7 +522,7 @@ io.on('connection', (socket) => {
 
   // 강의자: 질문과 답변 전체 초기화 (학생 접속 정보는 유지)
   socket.on('instructor:reset_questions', (callback) => {
-    if (userRole !== 'instructor') {
+    if (socket.data.userRole !== 'instructor') {
       return callback?.({ success: false, message: '권한이 없습니다.' });
     }
 
@@ -499,11 +542,11 @@ io.on('connection', (socket) => {
 
   // 연결 종료 처리
   socket.on('disconnect', () => {
-    if (userRole === 'instructor') {
+    if (socket.data.userRole === 'instructor') {
       closeQuestionIfNoInstructors();
     }
-    if (userRole === 'student' && currentStudentId) {
-      const student = state.students.get(currentStudentId);
+    if (socket.data.userRole === 'student' && socket.data.currentStudentId) {
+      const student = state.students.get(socket.data.currentStudentId);
       if (student && student.socketId === socket.id) {
         student.connected = false;
         io.to('room:instructors').emit('students:count', {

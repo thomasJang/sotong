@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { socket } from '../socket';
 import { Sparkles, MessageCircle, Send, CheckCircle2, RefreshCw, Lock, AlertCircle, Clock } from 'lucide-react';
 import confetti from 'canvas-confetti';
@@ -8,6 +8,8 @@ export default function StudentView() {
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const [isSubmittingAuth, setIsSubmittingAuth] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState('');
+  const authAttemptRef = useRef(0);
 
   // 학생 정보 (로컬 스토리지에 캐싱)
   const [student, setStudent] = useState(() => {
@@ -27,18 +29,23 @@ export default function StudentView() {
 
   // 접속 초기화
   useEffect(() => {
-    // 이미 저장된 비밀번호가 있으면 자동 인증 시도
-    const savedPw = localStorage.getItem('student_pw');
-    if (savedPw === '1234') {
-      attemptAuth(savedPw);
-    }
+    const restoreAuthentication = () => {
+      const savedPw = localStorage.getItem('student_pw');
+      if (savedPw) attemptAuth(savedPw, { restoreSession: true });
+      else clearAuthentication();
+    };
+    const handleSessionEnded = () => {
+      clearAuthentication('강의가 종료되었습니다. 다시 입장하려면 비밀번호를 입력해주세요.');
+    };
 
     // 소켓 이벤트 수신
     const handleActiveChanged = ({ activeQuestion: question }) => {
       setActiveQuestion(question);
       if (question) {
         // 내 기존 답변이 있는지 동기화
+        const attemptId = authAttemptRef.current;
         socket.emit('student:sync_state', (res) => {
+          if (attemptId !== authAttemptRef.current) return;
           if (res?.myAnswer !== undefined && res?.myAnswer !== null) {
             setMyAnswer(res.myAnswer);
             setTextInput(res.myAnswer);
@@ -54,33 +61,58 @@ export default function StudentView() {
     };
 
     socket.on('question:active_changed', handleActiveChanged);
+    socket.on('students:session_ended', handleSessionEnded);
+    socket.on('connect', restoreAuthentication);
+    if (socket.connected) restoreAuthentication();
 
     return () => {
       socket.off('question:active_changed', handleActiveChanged);
+      socket.off('students:session_ended', handleSessionEnded);
+      socket.off('connect', restoreAuthentication);
     };
   }, []);
 
   // 인증 요청 함수
-  const attemptAuth = (pw) => {
+  const attemptAuth = (pw, { restoreSession = false } = {}) => {
+    const attemptId = ++authAttemptRef.current;
     setIsSubmittingAuth(true);
     setErrorMsg('');
 
-    const currentStudentId = student?.id || null;
+    let currentStudentId = null;
+    try {
+      currentStudentId = JSON.parse(localStorage.getItem('student_profile'))?.id || null;
+    } catch {
+      localStorage.removeItem('student_profile');
+    }
 
-    socket.emit('student:auth', { password: pw, studentId: currentStudentId }, (res) => {
+    socket.timeout(8000).emit('student:auth', {
+      password: pw,
+      studentId: currentStudentId,
+      restoreSession,
+      sessionId: localStorage.getItem('student_session_id')
+    }, (error, res) => {
+      if (attemptId !== authAttemptRef.current) return;
       setIsSubmittingAuth(false);
+      if (error) {
+        setErrorMsg('서버 연결을 확인한 뒤 다시 시도해주세요.');
+        return;
+      }
       if (res.success) {
         setIsAuthenticated(true);
+        setSessionNotice('');
         setStudent(res.student);
         localStorage.setItem('student_pw', pw);
         localStorage.setItem('student_profile', JSON.stringify(res.student));
+        localStorage.setItem('student_session_id', res.sessionId);
 
         setActiveQuestion(res.activeQuestion);
-        if (res.myAnswer !== undefined && res.myAnswer !== null) {
-          setMyAnswer(res.myAnswer);
-          setTextInput(res.myAnswer);
-        }
+        setMyAnswer(res.myAnswer ?? '');
+        setTextInput(res.myAnswer ?? '');
       } else {
+        if (restoreSession || res.sessionEnded) {
+          clearAuthentication(res.message || '다시 입장해주세요.');
+          return;
+        }
         setErrorMsg(res.message || '비밀번호가 올바르지 않습니다.');
       }
     });
@@ -91,10 +123,25 @@ export default function StudentView() {
     attemptAuth(password);
   };
 
-  const handleLogout = () => {
+  const clearAuthentication = (notice = '') => {
+    authAttemptRef.current++;
     localStorage.removeItem('student_pw');
+    localStorage.removeItem('student_session_id');
     setIsAuthenticated(false);
+    setIsSubmittingAuth(false);
+    setIsSubmittingAnswer(false);
     setPassword('');
+    setActiveQuestion(null);
+    setMyAnswer('');
+    setTextInput('');
+    setLastSavedNotice(null);
+    setErrorMsg('');
+    setSessionNotice(notice);
+  };
+
+  const handleLogout = () => {
+    socket.volatile.emit('student:logout');
+    clearAuthentication();
   };
 
   // 답변 제출 및 변경 처리
@@ -102,6 +149,7 @@ export default function StudentView() {
     if (!activeQuestion || !answerValue || !answerValue.toString().trim()) return;
 
     setIsSubmittingAnswer(true);
+    const attemptId = authAttemptRef.current;
     socket.emit(
       'student:submit_answer',
       {
@@ -109,6 +157,7 @@ export default function StudentView() {
         answer: answerValue
       },
       (res) => {
+        if (attemptId !== authAttemptRef.current) return;
         setIsSubmittingAnswer(false);
         if (res?.success) {
           const isChange = myAnswer && myAnswer !== answerValue;
@@ -147,6 +196,8 @@ export default function StudentView() {
           <p className="text-sm text-slate-500 mb-6 text-center">
             강의자가 안내한 학생 입장 비밀번호를<br />입력해 주세요.
           </p>
+
+          {sessionNotice && <p role="status" className="mb-4 text-sm text-indigo-700 text-center">{sessionNotice}</p>}
 
           <form onSubmit={handlePasswordSubmit} className="w-full space-y-4">
             <div>
