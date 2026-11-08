@@ -37,6 +37,12 @@ export default function StudentView() {
     const handleSessionEnded = () => {
       clearAuthentication('강의가 종료되었습니다. 다시 입장하려면 비밀번호를 입력해주세요.');
     };
+    const handleDisconnect = () => {
+      authAttemptRef.current++;
+      setIsAuthenticated(false);
+      setIsSubmittingAuth(false);
+      setIsSubmittingAnswer(false);
+    };
 
     // 소켓 이벤트 수신
     const handleActiveChanged = ({ activeQuestion: question }) => {
@@ -63,12 +69,14 @@ export default function StudentView() {
     socket.on('question:active_changed', handleActiveChanged);
     socket.on('students:session_ended', handleSessionEnded);
     socket.on('connect', restoreAuthentication);
+    socket.on('disconnect', handleDisconnect);
     if (socket.connected) restoreAuthentication();
 
     return () => {
       socket.off('question:active_changed', handleActiveChanged);
       socket.off('students:session_ended', handleSessionEnded);
       socket.off('connect', restoreAuthentication);
+      socket.off('disconnect', handleDisconnect);
     };
   }, []);
 

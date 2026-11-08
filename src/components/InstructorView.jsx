@@ -52,6 +52,14 @@ export default function InstructorView() {
       if (savedPw) attemptAuth(savedPw);
       else setIsAuthenticated(false);
     };
+    const handleDisconnect = () => {
+      authAttemptRef.current++;
+      setIsAuthenticated(false);
+      setIsAuthLoading(false);
+      setIsQrOpen(false);
+      setIsNewQuestionOpen(false);
+      setIsResetConfirmOpen(false);
+    };
 
     // 소켓 이벤트 리스너 등록
     const handleActiveChanged = ({ activeQuestionId: id }) => {
@@ -89,6 +97,7 @@ export default function InstructorView() {
     socket.on('summaries:sync', handleSummariesSync);
     socket.on('students:count', handleStudentsCount);
     socket.on('connect', restoreAuthentication);
+    socket.on('disconnect', handleDisconnect);
     if (socket.connected) restoreAuthentication();
 
     return () => {
@@ -98,6 +107,7 @@ export default function InstructorView() {
       socket.off('summaries:sync', handleSummariesSync);
       socket.off('students:count', handleStudentsCount);
       socket.off('connect', restoreAuthentication);
+      socket.off('disconnect', handleDisconnect);
     };
   }, []);
 
