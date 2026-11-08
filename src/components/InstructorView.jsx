@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { socket } from '../socket';
 import {
   Users, QrCode, PlusCircle, Play, Square, Trash2,
@@ -25,6 +25,16 @@ export default function InstructorView() {
   // 모달 및 폼 상태
   const [isQrOpen, setIsQrOpen] = useState(false);
   const [isNewQuestionOpen, setIsNewQuestionOpen] = useState(false);
+  const [isResettingQuestions, setIsResettingQuestions] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
+  const [resetError, setResetError] = useState('');
+  const resetDialogRef = useRef(null);
+
+  useEffect(() => {
+    if (isResetConfirmOpen) resetDialogRef.current?.showModal();
+    else resetDialogRef.current?.close();
+  }, [isResetConfirmOpen]);
 
   // 새 질문 작성 폼 필드
   const [newTitle, setNewTitle] = useState('');
@@ -49,6 +59,9 @@ export default function InstructorView() {
 
     const handleListUpdated = ({ questions: list }) => {
       setQuestions(list);
+      setSelectedQuestionId(previous => (
+        list.some(question => question.id === previous) ? previous : (list[0]?.id || null)
+      ));
     };
 
     const handleSummaryUpdated = ({ questionId, summary }) => {
@@ -108,9 +121,29 @@ export default function InstructorView() {
   };
 
   const handleLogout = () => {
-    localStorage.removeItem('instructor_pw');
-    setIsAuthenticated(false);
-    setPassword('');
+    if (isLoggingOut) return;
+    const finishLogout = () => {
+      localStorage.removeItem('instructor_pw');
+      setIsAuthenticated(false);
+      setPassword('');
+      setIsQrOpen(false);
+      setIsNewQuestionOpen(false);
+      setIsResetConfirmOpen(false);
+    };
+    if (!socket.connected) {
+      finishLogout();
+      return;
+    }
+
+    setIsLoggingOut(true);
+    socket.volatile.timeout(5000).emit('instructor:logout', (error, res) => {
+      setIsLoggingOut(false);
+      if (error || !res?.success) {
+        alert(res?.message || '종료 결과를 확인하지 못했습니다. 연결 상태를 확인해주세요.');
+        return;
+      }
+      finishLogout();
+    });
   };
 
   // 새 질문 모달 열기
@@ -167,6 +200,31 @@ export default function InstructorView() {
     if (!window.confirm('정말 이 질문을 삭제하시겠습니까? 관련 답변 데이터도 함께 삭제됩니다.')) return;
     socket.emit('instructor:delete_question', { questionId: id }, (res) => {
       if (!res.success) alert(res.message);
+    });
+  };
+
+  const handleResetQuestions = () => {
+    if (isResettingQuestions || questions.length === 0) return;
+    setResetError('');
+    setIsResetConfirmOpen(true);
+  };
+
+  const handleConfirmReset = () => {
+    if (isResettingQuestions) return;
+    if (!socket.connected) {
+      setResetError('서버 연결을 확인한 뒤 다시 시도해주세요.');
+      return;
+    }
+
+    setResetError('');
+    setIsResettingQuestions(true);
+    socket.volatile.timeout(5000).emit('instructor:reset_questions', (error, res) => {
+      setIsResettingQuestions(false);
+      if (error || !res?.success) {
+        setResetError(res?.message || '초기화 결과를 확인하지 못했습니다. 연결 상태를 확인해주세요.');
+        return;
+      }
+      setIsResetConfirmOpen(false);
     });
   };
 
@@ -285,9 +343,10 @@ export default function InstructorView() {
             {/* 로그아웃 버튼 */}
             <button
               onClick={handleLogout}
-              className="text-xs text-slate-400 hover:text-white px-2 py-1.5 transition"
+              disabled={isLoggingOut}
+              className="text-xs text-slate-400 hover:text-white px-2 py-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              종료
+              {isLoggingOut ? '종료 중...' : '종료'}
             </button>
           </div>
         </div>
@@ -408,6 +467,17 @@ export default function InstructorView() {
                   );
                 })
               )}
+            </div>
+            <div className="mt-4 pt-4 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={handleResetQuestions}
+                disabled={questions.length === 0 || isResettingQuestions}
+                className="w-full flex items-center justify-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2.5 text-xs font-semibold text-rose-600 hover:bg-rose-100 transition disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Trash2 className="w-4 h-4" />
+                {isResettingQuestions ? '초기화 중...' : '질문 모두 초기화'}
+              </button>
             </div>
           </div>
         </div>
@@ -747,6 +817,43 @@ export default function InstructorView() {
           </div>
         </div>
       )}
+
+      <dialog
+        ref={resetDialogRef}
+        aria-labelledby="reset-questions-title"
+        aria-describedby="reset-questions-description"
+        onCancel={(event) => {
+          if (isResettingQuestions) event.preventDefault();
+        }}
+        onClose={() => setIsResetConfirmOpen(false)}
+        className="m-auto w-[calc(100%-2rem)] max-w-md rounded-2xl border border-slate-200 p-6 shadow-2xl backdrop:bg-slate-900/60 backdrop:backdrop-blur-sm"
+      >
+        <h2 id="reset-questions-title" className="text-lg font-bold text-slate-900">질문을 모두 초기화할까요?</h2>
+        <p id="reset-questions-description" className="mt-3 text-sm leading-relaxed text-slate-600">
+          등록된 질문과 모든 학생의 응답이 삭제됩니다. 진행 중인 질문도 종료되며 삭제한 내용은 복구할 수 없습니다.
+          학생 접속은 유지됩니다.
+        </p>
+        {resetError && <p role="alert" className="mt-3 text-sm text-rose-600">{resetError}</p>}
+        <div className="mt-6 flex gap-2">
+          <button
+            type="button"
+            autoFocus
+            onClick={() => setIsResetConfirmOpen(false)}
+            disabled={isResettingQuestions}
+            className="flex-1 rounded-xl border border-slate-300 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+          >
+            취소
+          </button>
+          <button
+            type="button"
+            onClick={handleConfirmReset}
+            disabled={isResettingQuestions}
+            className="flex-1 rounded-xl bg-rose-600 py-2.5 text-sm font-semibold text-white hover:bg-rose-700 disabled:opacity-40"
+          >
+            {isResettingQuestions ? '초기화 중...' : '모두 삭제하고 초기화'}
+          </button>
+        </div>
+      </dialog>
 
       {/* QR코드 모달 */}
       <QRModal isOpen={isQrOpen} onClose={() => setIsQrOpen(false)} />

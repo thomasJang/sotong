@@ -217,6 +217,15 @@ function getOnlineStudentCount() {
   return count;
 }
 
+function closeQuestionIfNoInstructors() {
+  if (io.sockets.adapter.rooms.get('room:instructors')?.size || !state.activeQuestionId) return;
+  state.activeQuestionId = null;
+  io.emit('question:active_changed', {
+    activeQuestionId: null,
+    activeQuestion: null
+  });
+}
+
 // Socket.IO 이벤트 처리
 io.on('connection', (socket) => {
   let userRole = null; // 'instructor' | 'student'
@@ -242,6 +251,17 @@ io.on('connection', (socket) => {
         onlineStudentsCount: getOnlineStudentCount()
       }
     });
+  });
+
+  socket.on('instructor:logout', async (callback) => {
+    if (userRole !== 'instructor') {
+      return callback?.({ success: false, message: '권한이 없습니다.' });
+    }
+
+    userRole = null;
+    await socket.leave('room:instructors');
+    closeQuestionIfNoInstructors();
+    callback?.({ success: true });
   });
 
   // 2. 학생 인증 및 입장
@@ -457,8 +477,31 @@ io.on('connection', (socket) => {
     callback?.({ success: true });
   });
 
+  // 강의자: 질문과 답변 전체 초기화 (학생 접속 정보는 유지)
+  socket.on('instructor:reset_questions', (callback) => {
+    if (userRole !== 'instructor') {
+      return callback?.({ success: false, message: '권한이 없습니다.' });
+    }
+
+    state.questions = [];
+    state.answers = {};
+    state.activeQuestionId = null;
+
+    io.emit('questions:list_updated', { questions: [] });
+    io.emit('question:active_changed', {
+      activeQuestionId: null,
+      activeQuestion: null
+    });
+    io.to('room:instructors').emit('summaries:sync', { summaries: {} });
+
+    callback?.({ success: true });
+  });
+
   // 연결 종료 처리
   socket.on('disconnect', () => {
+    if (userRole === 'instructor') {
+      closeQuestionIfNoInstructors();
+    }
     if (userRole === 'student' && currentStudentId) {
       const student = state.students.get(currentStudentId);
       if (student && student.socketId === socket.id) {

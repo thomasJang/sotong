@@ -23,7 +23,7 @@ try {
     assert.match(await response.text(), /<div id="root"><\/div>/);
   }
   const test = spawnSync(process.execPath, ['test-flow.js'], {
-    env: { ...process.env, SERVER_URL: `http://127.0.0.1:${port}`, EXPECTED_PUBLIC_URL: 'https://lecture.example.com', INSTRUCTOR_PASSWORD: '1937', STUDENT_PASSWORD: '1234' },
+    env: { ...process.env, SERVER_URL: `http://127.0.0.1:${port}`, EXPECTED_PUBLIC_URL: 'https://lecture.example.com', INSTRUCTOR_PASSWORD: '1937', STUDENT_PASSWORD: '1234', TEST_RESET_QUESTIONS: '1' },
     stdio: 'inherit', timeout: 35000
   });
   assert.equal(test.status, 0, 'Interaction checks failed');
